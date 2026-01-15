@@ -1,6 +1,10 @@
 import torch
 import torch.nn as nn 
 import math
+from gpu_profiler import GPUProfiler
+
+profiler = GPUProfiler()
+
 
 class input_embeddings(nn.Module):
     def __init__(self, d_model: int, vocab_size: int):
@@ -10,7 +14,10 @@ class input_embeddings(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)   # inputs --> index number --> vector of 512 dimension
             
     def forward(self, x):
-        return self.embedding(x) * math.sqrt(self.d_model)      # given index number --> returns vector   
+        profiler.start()
+        x = self.embedding(x) * math.sqrt(self.d_model) # given index number --> returns vector 
+        profiler.end("Input Embedding") 
+        return x
     
     
 class positional_encoding(nn.Module):
@@ -39,9 +46,13 @@ class positional_encoding(nn.Module):
         self.register_buffer('pe', pe)
         
     def forward(self, x):
+        
+        profiler.start()
         # adding the positional encoding to word of a sentence
         x = x + self.pe[:, :x.shape[1], :]   # buffer does not require grad
-        return self.dropout(x)
+        x = self.dropout(x)
+        profiler.end("Positional Encoding")
+        return x
         
 
 class layer_normalization(nn.Module):
@@ -65,8 +76,13 @@ class feed_forwardblock(nn.Module):
         self.linear_2 = nn.Linear(d_ff, d_model)
         
     def forward(self, x):
+        profiler.start()
         # (batch, seq_len , d_model) --> linear1 --> linear2
-        return self.linear_2(self.dropout(torch.relu(self.linear_1(x))))          
+        x = self.linear_2(self.dropout(torch.relu(self.linear_1(x)))) 
+       
+        profiler.end("FeedForward")
+        
+        return x       
 
 
 class multihead_attentionblock(nn.Module):
@@ -102,6 +118,8 @@ class multihead_attentionblock(nn.Module):
         return (attention_scores @ value), attention_scores
         
     def forward(self, q, k, v, mask):
+        profiler.start()
+        
         query = self.w_q(q)  # Q'
         key = self.w_k(k)    # K'
         value = self.w_v(v)  # V'
@@ -117,8 +135,10 @@ class multihead_attentionblock(nn.Module):
         
         # (batch, h, seq_len, d_k) --> (batch, seq_len, d_model)
         x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
+        x = self.w_o(x)
         
-        return self.w_o(x)
+        profiler.end("MultiHeadAttention")
+        return x
     
 
 class residual_connection(nn.Module):
@@ -208,7 +228,10 @@ class projection_layer(nn.Module):
         self.proj = nn.Linear(d_model, vocab_size)
         
     def forward(self, x):
-        return torch.log_softmax(self.proj(x), dim=-1)
+        profiler.start()
+        out = torch.log_softmax(self.proj(x), dim=-1)
+        profiler.end("Projection")
+        return out
     
     
 class transformer(nn.Module):

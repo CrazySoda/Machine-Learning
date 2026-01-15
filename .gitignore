@@ -2,6 +2,9 @@ env/
 venv/
 ml_env/
 __pycache__/
+tb_logs/
 
 src_tokenizer.json
 tgt_tokenizer.json
+
+*.log
