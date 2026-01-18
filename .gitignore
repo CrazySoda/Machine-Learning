@@ -8,3 +8,4 @@ src_tokenizer.json
 tgt_tokenizer.json
 
 *.log
+.venv
