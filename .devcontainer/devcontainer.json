@@ -1,0 +1,31 @@
+{
+    "name": "Machine Learning Env",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python",
+                "ms-python.vscode-pylance",
+                "ms-toolsai.jupyter",
+                "njpwerner.autodocstring",
+                "donjayamanne.python-environment-manager"
+            ]
+        }
+    },
+    "remoteUser": "root",
+    "features": {
+        "ghcr.io/devcontainers/features/common-utils:2": {
+            "installZsh": true,
+            "username": "vscode",
+            "userUid": "1000",
+            "userGid": "1000",
+            "upgradePackages": true
+        },
+        "ghcr.io/devcontainers/features/git:1": {}
+    },
+    // Post-create command to ensure everything is set up
+    "postCreateCommand": "pip install -r requirements.txt"
+}
