@@ -111,9 +111,9 @@ class local_attention_block(nn.Module):
         # Local Attention Mask
         # We want to mask out keys that are further than window_size from the query
         # Create a local mask
-        local_mask = torch.ones(seq_len, seq_len, device=q.device).tril(0) & \
-                     torch.ones(seq_len, seq_len, device=q.device).triu(-self.window_size)
-        local_mask = local_mask.bool().unsqueeze(0).unsqueeze(0) # (1, 1, seq_len, seq_len)
+        local_mask = (torch.ones(seq_len, seq_len, device=q.device).tril(0).bool() & 
+                     torch.ones(seq_len, seq_len, device=q.device).triu(-self.window_size).bool())
+        local_mask = local_mask.unsqueeze(0).unsqueeze(0) # (1, 1, seq_len, seq_len)
         
         if mask is not None:
              local_mask = local_mask & mask
