@@ -9,3 +9,4 @@ tgt_tokenizer.json
 
 *.log
 .venv
+.gitignore
