@@ -113,11 +113,30 @@ class multihead_attentionblock(nn.Module):
         
         # Linformer: project keys and values from seq_len to k dimension
         if E_proj is not None and F_proj is not None:
-            # key, value: (batch, h, seq_len, d_k)
-            # E_proj, F_proj: (seq_len, k)
+            # Get actual sequence length from key/value
+            actual_seq_len = key.shape[2]
+            
+            # Truncate or pad projection matrices to match actual sequence length
+            if actual_seq_len <= E_proj.shape[0]:
+                E_proj_actual = E_proj[:actual_seq_len, :]
+                F_proj_actual = F_proj[:actual_seq_len, :]
+            else:
+                # If sequence is longer than expected, pad projection matrices
+                pad_size = actual_seq_len - E_proj.shape[0]
+                E_proj_actual = torch.cat([E_proj, torch.randn(pad_size, E_proj.shape[1], device=E_proj.device) / math.sqrt(E_proj.shape[1])], dim=0)
+                F_proj_actual = torch.cat([F_proj, torch.randn(pad_size, F_proj.shape[1], device=F_proj.device) / math.sqrt(F_proj.shape[1])], dim=0)
+            
+            # key, value: (batch, h, actual_seq_len, d_k)
+            # E_proj_actual, F_proj_actual: (actual_seq_len, k)
             # Result: (batch, h, k, d_k)
-            key = torch.einsum('bhsd,sk->bhkd', key, E_proj)
-            value = torch.einsum('bhsd,sk->bhkd', value, F_proj)
+            key = torch.einsum('bhsd,sk->bhkd', key, E_proj_actual)
+            value = torch.einsum('bhsd,sk->bhkd', value, F_proj_actual)
+            
+            # Project mask as well: (batch, 1, 1 or seq_len, actual_seq_len) -> (batch, 1, 1 or seq_len, k)
+            if mask is not None:
+                # mask: (batch, 1, 1 or seq_len, actual_seq_len)
+                # Project the last dimension using E_proj_actual
+                mask = torch.einsum('b...s,sk->b...k', mask.float(), E_proj_actual) > 0
         
         # attention_scores: (batch, h, seq_len, k) for Linformer or (batch, h, seq_len, seq_len) for standard
         attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
