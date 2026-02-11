@@ -20,6 +20,10 @@ pandas==2.1.1
 scikit-learn==1.3.0
 
 #profiling
+tensorboard
+
+#transformer
+transformers==4.46.1
 
 
 # Monitoring

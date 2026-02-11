@@ -1,206 +1,230 @@
+# train_test_fixed.py
+
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
 from datasets import load_dataset
-from tokenizers import Tokenizer
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
-from tokenizers.pre_tokenizers import ByteLevel
-from model import build_transformer
+from transformers import BertModel, BertTokenizer
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score, confusion_matrix
 from tqdm import tqdm
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from sklearn.model_selection import train_test_split
-import math
 
-# ===============================
+from model_updated import build_transformer, multihead_attentionblock
+
+# =====================================================
+# DEVICE
+# =====================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# =====================================================
 # CONFIG
-# ===============================
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Device:", DEVICE)
+# =====================================================
+MAX_LEN = 512
+BATCH_SIZE = 8
+EPOCHS = 3
+LR = 2e-5
+D_MODEL = 768
+N_LAYERS = 12
+N_HEADS = 12
+D_FF = 3072 
 
-SRC_LANG = "en"
-TGT_LANG = "de"
+# =====================================================
+# LOAD IMDB DATASET
+# =====================================================
+dataset = load_dataset("imdb")
+tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
-SRC_SEQ_LEN = 60
-TGT_SEQ_LEN = 60
-BATCH_SIZE = 64
-EPOCHS = 40
-
-D_MODEL = 256
-N = 4
-H = 4
-D_FF = 1024
-DROPOUT = 0.25
-PAD_IDX = 0
-
-# ===============================
-# LOAD DATASET
-# ===============================
-print("Downloading dataset...")
-dataset = load_dataset("Helsinki-NLP/opus_books", "de-en")
-train_data = list(dataset["train"])
-
-train_data, val_data = train_test_split(train_data, test_size=0.05, random_state=42)
-print(f"Train samples: {len(train_data)}, Validation samples: {len(val_data)}")
-
-# ===============================
-# TOKENIZER (BPE)
-# ===============================
-def train_tokenizer(sentences):
-    tokenizer = Tokenizer(BPE(unk_token="<unk>"))
-    tokenizer.pre_tokenizer = ByteLevel()
-    trainer = BpeTrainer(
-        vocab_size=12000,
-        min_frequency=2,
-        special_tokens=["<pad>", "<sos>", "<eos>", "<unk>"]
+def tokenize(batch):
+    return tokenizer(
+        batch["text"],
+        padding="max_length",
+        truncation=True,
+        max_length=MAX_LEN
     )
-    tokenizer.train_from_iterator(sentences, trainer)
-    return tokenizer
 
-print("Training tokenizers...")
-src_tokenizer = train_tokenizer(s["translation"][SRC_LANG] for s in train_data)
-tgt_tokenizer = train_tokenizer(s["translation"][TGT_LANG] for s in train_data)
+dataset = dataset.map(tokenize, batched=True)
+dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 
-src_tokenizer.save("src_tokenizer.json")
-tgt_tokenizer.save("tgt_tokenizer.json")
+train_loader = DataLoader(dataset["train"], batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(dataset["test"], batch_size=BATCH_SIZE)
 
-SRC_VOCAB_SIZE = src_tokenizer.get_vocab_size()
-TGT_VOCAB_SIZE = tgt_tokenizer.get_vocab_size()
-print("Vocab sizes:", SRC_VOCAB_SIZE, TGT_VOCAB_SIZE)
+# =====================================================
+# BUILD TRANSFORMER
+# =====================================================
+transformer_model = build_transformer(
+    src_vocab_size=tokenizer.vocab_size,
+    tgt_vocab_size=2,
+    src_seq_len=MAX_LEN,
+    tgt_seq_len=MAX_LEN,
+    d_model=D_MODEL,
+    N=N_LAYERS,
+    h=N_HEADS,
+    d_ff=D_FF, 
+    attention_type="standard"
+).to(device)
 
-# ===============================
-# DATASET
-# ===============================
-class TranslationDataset(Dataset):
-    def __init__(self, data):
-        self.data = data
+# =====================================================
+# CLASSIFIER WITH CLS POOLING
+# =====================================================
+class Classifier(nn.Module):
+    def __init__(self, transformer):
+        super().__init__()
+        self.transformer = transformer
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Linear(D_MODEL, 2)
 
-    def encode(self, tokenizer, text, max_len):
-        ids = tokenizer.encode(text).ids
-        ids = [1] + ids + [2]
-        ids = ids[:max_len]
-        ids += [PAD_IDX] * (max_len - len(ids))
-        return torch.tensor(ids)
+        # Embedding LayerNorm and Dropout (for BERT embedding transfer)
+        self.src_embed_layernorm = nn.LayerNorm(D_MODEL)
+        self.src_embed_dropout = nn.Dropout(0.1)
 
-    def __getitem__(self, idx):
-        item = self.data[idx]["translation"]
-        return (
-            self.encode(src_tokenizer, item[SRC_LANG], SRC_SEQ_LEN),
-            self.encode(tgt_tokenizer, item[TGT_LANG], TGT_SEQ_LEN),
-        )
+    def forward(self, input_ids, attention_mask):
+        # --- Embeddings ---
+        x = self.transformer.src_embed(input_ids)
+        x = x + self.transformer.src_pos.pe[:, :x.shape[1], :]
+        x = self.src_embed_layernorm(x)
+        x = self.src_embed_dropout(x)
 
-    def __len__(self):
-        return len(self.data)
+        # --- Attention mask ---
+        mask = attention_mask.unsqueeze(1).unsqueeze(2)
 
-train_loader = DataLoader(TranslationDataset(train_data), batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(TranslationDataset(val_data), batch_size=BATCH_SIZE)
+        # --- Encoder ---
+        x = self.transformer.encoder(x, mask)
 
-# ===============================
-# MASKS
-# ===============================
-def create_src_mask(src):
-    return (src != PAD_IDX).unsqueeze(1).unsqueeze(2)
+        # --- CLS token pooling ---
+        cls_representation = x[:, 0, :]
+        cls_representation = self.dropout(cls_representation)
+        return self.classifier(cls_representation)
 
-def create_tgt_mask(tgt):
-    seq_len = tgt.size(1)
-    padding = (tgt != PAD_IDX).unsqueeze(1).unsqueeze(2)
-    nopeak = torch.tril(torch.ones((1, seq_len, seq_len), device=tgt.device)).bool()
-    return padding & nopeak
+classifier_model = Classifier(transformer_model).to(device)
 
-# ===============================
-# MODEL
-# ===============================
-model = build_transformer(
-    SRC_VOCAB_SIZE, TGT_VOCAB_SIZE,
-    SRC_SEQ_LEN, TGT_SEQ_LEN,
-    d_model=D_MODEL, N=N, h=H,
-    dropout=DROPOUT, d_ff=D_FF
-).to(DEVICE)
+# =====================================================
+# LOAD BERT
+# =====================================================
+print("Loading pretrained BERT...")
+bert = BertModel.from_pretrained("bert-base-uncased").to(device)
 
-criterion = nn.NLLLoss(ignore_index=PAD_IDX)
+print("Transferring weights...")
 
-# ===============================
-# OPTIMIZER + WARMUP
-# ===============================
-optimizer = torch.optim.Adam(model.parameters(), betas=(0.9, 0.98), eps=1e-9)
+# ---------------- Embeddings ----------------
+classifier_model.transformer.src_embed.embedding.weight.data.copy_(
+    bert.embeddings.word_embeddings.weight.data
+)
 
-class WarmupScheduler:
-    def __init__(self, optimizer, d_model, warmup=4000):
-        self.optimizer = optimizer
-        self.step_num = 0
-        self.d_model = d_model
-        self.warmup = warmup
+# Position embeddings
+classifier_model.transformer.src_pos.pe[:, :MAX_LEN, :].data.copy_(
+    bert.embeddings.position_embeddings.weight.data.unsqueeze(0)
+)
 
-    def step(self):
-        self.step_num += 1
-        lr = (self.d_model ** -0.5) * min(
-            self.step_num ** -0.5,
-            self.step_num * self.warmup ** -1.5
-        )
-        for p in self.optimizer.param_groups:
-            p["lr"] = lr
-        self.optimizer.step()
+# Embedding LayerNorm
+classifier_model.src_embed_layernorm.weight.data.copy_(bert.embeddings.LayerNorm.weight.data)
+classifier_model.src_embed_layernorm.bias.data.copy_(bert.embeddings.LayerNorm.bias.data)
 
-scheduler = WarmupScheduler(optimizer, D_MODEL)
+# ---------------- Encoder layers ----------------
+for i, layer in enumerate(bert.encoder.layer):
+    our_layer = classifier_model.transformer.encoder.layers[i]
 
-# ===============================
-# BLEU
-# ===============================
-smooth_fn = SmoothingFunction().method1
+    # ----- SELF ATTENTION -----
+    our_layer.self_attention_block.w_q.weight.data.copy_(layer.attention.self.query.weight.data)
+    our_layer.self_attention_block.w_q.bias.data.copy_(layer.attention.self.query.bias.data)
 
-def evaluate(loader):
-    model.eval()
-    bleu = []
+    our_layer.self_attention_block.w_k.weight.data.copy_(layer.attention.self.key.weight.data)
+    our_layer.self_attention_block.w_k.bias.data.copy_(layer.attention.self.key.bias.data)
 
-    with torch.no_grad():
-        for src, tgt in loader:
-            src, tgt = src.to(DEVICE), tgt.to(DEVICE)
-            src_mask = create_src_mask(src)
+    our_layer.self_attention_block.w_v.weight.data.copy_(layer.attention.self.value.weight.data)
+    our_layer.self_attention_block.w_v.bias.data.copy_(layer.attention.self.value.bias.data)
 
-            tgt_in = tgt[:, :-1]
-            tgt_out = tgt[:, 1:]
-            tgt_mask = create_tgt_mask(tgt_in)
+    our_layer.self_attention_block.w_o.weight.data.copy_(layer.attention.output.dense.weight.data)
+    our_layer.self_attention_block.w_o.bias.data.copy_(layer.attention.output.dense.bias.data)
 
-            enc = model.encode(src, src_mask)
-            dec = model.decode(enc, src_mask, tgt_in, tgt_mask)
-            out = model.project(dec)
+    # Add dropout after attention output
+    our_layer.self_attention_block.dropout.p = layer.attention.output.dropout.p
 
-            pred = out.argmax(-1)
+    # ----- FEED FORWARD -----
+    our_layer.feed_forward_block.linear_1.weight.data.copy_(layer.intermediate.dense.weight.data)
+    our_layer.feed_forward_block.linear_1.bias.data.copy_(layer.intermediate.dense.bias.data)
 
-            for p, t in zip(pred, tgt_out):
-                p = [x for x in p.tolist() if x not in [0,1,2]]
-                t = [x for x in t.tolist() if x not in [0,1,2]]
-                if len(t) > 0:
-                    bleu.append(sentence_bleu([t], p, smoothing_function=smooth_fn))
+    our_layer.feed_forward_block.linear_2.weight.data.copy_(layer.output.dense.weight.data)
+    our_layer.feed_forward_block.linear_2.bias.data.copy_(layer.output.dense.bias.data)
 
-    return sum(bleu) / len(bleu)
+    # ----- LAYER NORMS -----
+    our_layer.residual_connections[0].norm.alpha.data.copy_(layer.attention.output.LayerNorm.weight.data)
+    our_layer.residual_connections[0].norm.bias.data.copy_(layer.attention.output.LayerNorm.bias.data)
 
-# ===============================
-# TRAIN
-# ===============================
+    our_layer.residual_connections[1].norm.alpha.data.copy_(layer.output.LayerNorm.weight.data)
+    our_layer.residual_connections[1].norm.bias.data.copy_(layer.output.LayerNorm.bias.data)
+
+print("Weight transfer complete.")
+
+# =====================================================
+# TRAINING SETUP
+# =====================================================
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.AdamW(classifier_model.parameters(), lr=LR)
+
+# =====================================================
+# TRAIN LOOP
+# =====================================================
 for epoch in range(EPOCHS):
-    model.train()
-    total = 0
-
-    for src, tgt in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
-        src, tgt = src.to(DEVICE), tgt.to(DEVICE)
-        tgt_in = tgt[:, :-1]
-        tgt_out = tgt[:, 1:]
-
-        src_mask = create_src_mask(src)
-        tgt_mask = create_tgt_mask(tgt_in)
-
-        enc = model.encode(src, src_mask)
-        dec = model.decode(enc, src_mask, tgt_in, tgt_mask)
-        out = model.project(dec)
-
-        loss = criterion(out.reshape(-1, out.size(-1)), tgt_out.reshape(-1))
+    classifier_model.train()
+    total_loss = 0
+    loop = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+    for batch in loop:
+        input_ids = batch["input_ids"].to(device)
+        mask = batch["attention_mask"].to(device)
+        labels = batch["label"].to(device)
 
         optimizer.zero_grad()
+
+        outputs = classifier_model(input_ids, mask)
+        loss = criterion(outputs, labels)
+
         loss.backward()
-        scheduler.step()
 
-        total += loss.item()
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(classifier_model.parameters(), 1.0)
 
-    print(f"Epoch {epoch+1} Loss: {total/len(train_loader):.3f}")
-    print("Validation BLEU:", evaluate(val_loader))
+        optimizer.step()
+        total_loss += loss.item()
+        loop.set_postfix(loss=loss.item())
+
+    print(f"Epoch {epoch+1} Loss: {total_loss/len(train_loader):.4f}")
+
+# =====================================================
+# EVALUATION
+# =====================================================
+classifier_model.eval()
+
+all_preds = []
+all_labels = []
+all_probs = []
+
+with torch.no_grad():
+    loop = tqdm(test_loader, desc=f"Testing")
+    for batch in loop:
+        input_ids = batch["input_ids"].to(device)
+        mask = batch["attention_mask"].to(device)
+        labels = batch["label"].to(device)
+
+        outputs = classifier_model(input_ids, mask)
+        probs = torch.softmax(outputs, dim=1)
+        preds = torch.argmax(probs, dim=1)
+
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        all_probs.extend(probs[:, 1].cpu().numpy())
+
+accuracy = accuracy_score(all_labels, all_preds)
+precision, recall, f1, _ = precision_recall_fscore_support(all_labels, all_preds, average="binary")
+roc_auc = roc_auc_score(all_labels, all_probs)
+conf_matrix = confusion_matrix(all_labels, all_preds)
+
+print("\n========== IMDB RESULTS ==========")
+print(f"Accuracy  : {accuracy:.4f}")
+print(f"Precision : {precision:.4f}")
+print(f"Recall    : {recall:.4f}")
+print(f"F1 Score  : {f1:.4f}")
+print(f"ROC-AUC   : {roc_auc:.4f}")
+print("\nConfusion Matrix:")
+print(conf_matrix)
