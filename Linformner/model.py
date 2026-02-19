@@ -53,7 +53,7 @@ class positional_encoding(nn.Module):
         x = self.dropout(x)
         profiler.end("Positional Encoding")
         return x
-    
+        
 
 class layer_normalization(nn.Module):
     def __init__(self, d_model: int, eps: float = 10**-6): # eps so that denominator isn't 0
@@ -84,98 +84,120 @@ class feed_forwardblock(nn.Module):
         
         return x       
 
-
 class multihead_attentionblock(nn.Module):
-    def __init__(self, d_model: int, h: int, dropout: float, seq_len: int, k: int):  # h = heads, k = projection dimension for Linformer
+    def __init__(self, d_model: int, h: int, dropout: float, linformer_scale: int = None):
+        """
+        Multi-head attention with optional Linformer projection.
+        Args:
+            d_model: embedding dimension
+            h: number of heads
+            dropout: dropout probability
+            linformer_scale: scale factor to reduce sequence length (e.g., 2, 4, 8, 16).
+                           If None, standard attention. If provided, seq_len will be reduced to seq_len/scale.
+        """
         super().__init__()
         self.d_model = d_model
-        self.h = h 
-        assert d_model % h == 0, "d_model is not divisible by h" 
-        
-        # d_model / h = dk 
+        self.h = h
+        assert d_model % h == 0, "d_model must be divisible by h"
         self.d_k = d_model // h
-        self.w_q = nn.Linear(d_model, d_model)  # Wq 
-        self.w_k = nn.Linear(d_model, d_model)  # Wk
-        self.w_v = nn.Linear(d_model, d_model)  # Wv
-        
-        self.w_o = nn.Linear(d_model, d_model)  # Wo
+
+        # Linear layers for Q, K, V
+        self.w_q = nn.Linear(d_model, d_model)
+        self.w_k = nn.Linear(d_model, d_model)
+        self.w_v = nn.Linear(d_model, d_model)
+
+        # Output linear
+        self.w_o = nn.Linear(d_model, d_model)
         self.dropout = nn.Dropout(dropout)
-        
-        # Linformer projection matrices: project sequence length from seq_len to k
-        self.seq_len = seq_len
-        self.k = k
-        self.E = nn.Parameter(torch.randn(seq_len, k) / math.sqrt(k))  # projection for keys
-        self.F = nn.Parameter(torch.randn(seq_len, k) / math.sqrt(k))  # projection for values
-    
+
+        # Linformer projection
+        self.linformer_scale = linformer_scale
+        self.E_k = None
+        self.E_v = None
+        self.seq_len_initialized = None
+
     @staticmethod
-    def attention(query, key, value, mask, dropout: nn.Dropout, E_proj=None, F_proj=None):
-        d_k = query.shape[-1]
-        
-        # Linformer: project keys and values from seq_len to k dimension
-        if E_proj is not None and F_proj is not None:
-            # Get actual sequence length from key/value
-            actual_seq_len = key.shape[2]
-            
-            # Truncate or pad projection matrices to match actual sequence length
-            if actual_seq_len <= E_proj.shape[0]:
-                E_proj_actual = E_proj[:actual_seq_len, :]
-                F_proj_actual = F_proj[:actual_seq_len, :]
-            else:
-                # If sequence is longer than expected, pad projection matrices
-                pad_size = actual_seq_len - E_proj.shape[0]
-                E_proj_actual = torch.cat([E_proj, torch.randn(pad_size, E_proj.shape[1], device=E_proj.device) / math.sqrt(E_proj.shape[1])], dim=0)
-                F_proj_actual = torch.cat([F_proj, torch.randn(pad_size, F_proj.shape[1], device=F_proj.device) / math.sqrt(F_proj.shape[1])], dim=0)
-            
-            # key, value: (batch, h, actual_seq_len, d_k)
-            # E_proj_actual, F_proj_actual: (actual_seq_len, k)
-            # Result: (batch, h, k, d_k)
-            key = torch.einsum('bhsd,sk->bhkd', key, E_proj_actual)
-            value = torch.einsum('bhsd,sk->bhkd', value, F_proj_actual)
-            
-            # Project mask as well: (batch, 1, 1 or seq_len, actual_seq_len) -> (batch, 1, 1 or seq_len, k)
-            if mask is not None:
-                # mask: (batch, 1, 1 or seq_len, actual_seq_len)
-                # Project the last dimension using E_proj_actual
-                mask = torch.einsum('b...s,sk->b...k', mask.float(), E_proj_actual) > 0
-        
-        # attention_scores: (batch, h, seq_len, k) for Linformer or (batch, h, seq_len, seq_len) for standard
-        attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
-        
-        # part of masked attention 
+    def attention(query, key, value, mask=None, dropout=None):
+        """
+        Compute scaled dot-product attention.
+        query: (batch, heads, seq_len_q, d_k)
+        key, value: (batch, heads, seq_len_k, d_k)
+        mask: (batch, 1, seq_len_q, seq_len_k) or (batch, 1, 1, seq_len_k)
+        """
+        d_k = query.size(-1)
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(d_k)
+
         if mask is not None:
-            attention_scores = attention_scores.masked_fill(mask == 0, -1e9)
-            
-        attention_scores = attention_scores.softmax(dim=-1)  
-        
+            scores = scores.masked_fill(mask == 0, float("-1e9"))
+
+        attn = torch.softmax(scores, dim=-1)
         if dropout is not None:
-            attention_scores = dropout(attention_scores)
-            
-        return (attention_scores @ value), attention_scores
-        
-    def forward(self, q, k, v, mask):
+            attn = dropout(attn)
+        output = torch.matmul(attn, value)
+        return output, attn
+
+    def forward(self, q, k, v, mask=None):
+        """
+        Forward pass.
+        q, k, v: (batch, seq_len, d_model)
+        mask: (batch, 1, seq_len, seq_len) or (batch, 1, 1, seq_len)
+        """
         profiler.start()
-        
-        query = self.w_q(q)  # Q'
-        key = self.w_k(k)    # K'
-        value = self.w_v(v)  # V'
-        
-        # split into small matrices (heads)
-        query = query.view(query.shape[0], query.shape[1], self.h, self.d_k).transpose(1, 2)
-        key = key.view(key.shape[0], key.shape[1], self.h, self.d_k).transpose(1, 2)
-        value = value.view(value.shape[0], value.shape[1], self.h, self.d_k).transpose(1, 2)
-        
-        # Linformer: pass projection matrices to attention
+        batch_size, seq_len, _ = q.shape
+
+        # Linear projections
+        query = self.w_q(q)
+        key = self.w_k(k)
+        value = self.w_v(v)
+
+        # --- Linformer projection ---
+        projected_mask = mask
+        if self.linformer_scale is not None and self.linformer_scale > 1:
+            k_reduced = seq_len // self.linformer_scale
+            
+            # Initialize projection matrices on first forward pass or if seq_len changed
+            if self.E_k is None or self.seq_len_initialized != seq_len:
+                self.E_k = nn.Parameter(torch.randn(k_reduced, seq_len, device=q.device) * 0.02)
+                self.E_v = nn.Parameter(torch.randn(k_reduced, seq_len, device=q.device) * 0.02)
+                self.seq_len_initialized = seq_len
+
+            # Apply mask to the full K and V BEFORE projecting to lower dimension
+            # This zeros out masked (e.g. padding / future) positions in the full sequence
+            # so the projection never sees invalid tokens.
+            if mask is not None and mask.dim() == 4:
+                # mask: (batch, 1, seq_q_or_1, seq_k)
+                # Collapse to per-key-position mask: valid if ANY query can attend to it
+                # (batch, 1, seq_q_or_1, seq_k) -> any over seq_q -> (batch, 1, seq_k)
+                #   -> squeeze head dim -> (batch, seq_k) -> float -> (batch, seq_k, 1)
+                key_mask = mask.any(dim=2).squeeze(1).float().unsqueeze(-1)  # (batch, seq_k, 1)
+                key = key * key_mask
+                value = value * key_mask
+
+            # Project K and V along sequence dimension
+            # key: (batch, seq_len, d_model) -> (batch, k_reduced, d_model)
+            key = (key.transpose(1, 2) @ self.E_k.T).transpose(1, 2)
+            value = (value.transpose(1, 2) @ self.E_v.T).transpose(1, 2)
+
+            # No mask needed after projection — invalid positions were already zeroed out
+            projected_mask = None
+
+        # Split heads
+        query = query.view(batch_size, seq_len, self.h, self.d_k).transpose(1, 2)  # (batch, h, seq_len, d_k)
+        key_seq_len = key.shape[1]  # k_reduced if Linformer, seq_len otherwise
+        key = key.view(batch_size, key_seq_len, self.h, self.d_k).transpose(1, 2)   # (batch, h, k_reduced/seq_len, d_k)
+        value = value.view(batch_size, key_seq_len, self.h, self.d_k).transpose(1, 2) # (batch, h, k_reduced/seq_len, d_k)
+
+        # Compute attention
         x, self.attention_scores = multihead_attentionblock.attention(
-            query, key, value, mask, self.dropout, self.E, self.F
+            query, key, value, projected_mask, self.dropout
         )
-        
-        # (batch, h, seq_len, d_k) --> (batch, seq_len, d_model)
-        x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
+
+        # Merge heads
+        x = x.transpose(1, 2).contiguous().view(batch_size, -1, self.h * self.d_k)
         x = self.w_o(x)
         
-        profiler.end("Linformer MultiHeadAttention")
+        profiler.end("Multi-Head Attention")
         return x
-    
 
 class residual_connection(nn.Module):
     def __init__(self, d_model: int, dropout: float):
@@ -297,12 +319,11 @@ class transformer(nn.Module):
     def project(self, x):
         return self.projection_layer(x)
     
-    
 def build_transformer(src_vocab_size: int, tgt_vocab_size: int,
                       src_seq_len: int, tgt_seq_len: int,
                       d_model: int = 512, N: int = 6,
                       h: int = 8, dropout: float = 0.1, d_ff: int = 2048,
-                      k: int = 256):  # k = projection dimension for Linformer
+                      linformer_scale: int = None):  # Add this parameter
 
     # create embedding layers 
     src_embed = input_embeddings(d_model, src_vocab_size)
@@ -312,21 +333,21 @@ def build_transformer(src_vocab_size: int, tgt_vocab_size: int,
     src_pos = positional_encoding(d_model, src_seq_len, dropout) 
     tgt_pos = positional_encoding(d_model, tgt_seq_len, dropout)
     
-    # create encoder blocks with Linformer attention
+    # create encoder blocks 
     encoder_blocks = []
     for _ in range(N):
-        encoder_self_attention_block = multihead_attentionblock(d_model, h, dropout, src_seq_len, k)
+        encoder_self_attention_block = multihead_attentionblock(d_model, h, dropout, linformer_scale)
         feed_forward_block_ = feed_forwardblock(d_model, d_ff, dropout)
         temp_encoder_block = encoder_block(
             encoder_self_attention_block, feed_forward_block_, d_model, dropout
         )
         encoder_blocks.append(temp_encoder_block)
         
-    # create decoder blocks with Linformer attention
+    # create decoder blocks 
     decoder_blocks = []
     for _ in range(N):
-        decoder_self_attention_block = multihead_attentionblock(d_model, h, dropout, tgt_seq_len, k)
-        decoder_cross_attention_block = multihead_attentionblock(d_model, h, dropout, src_seq_len, k)
+        decoder_self_attention_block = multihead_attentionblock(d_model, h, dropout, linformer_scale)
+        decoder_cross_attention_block = multihead_attentionblock(d_model, h, dropout, linformer_scale)
         feed_forward_block_ = feed_forwardblock(d_model, d_ff, dropout)
         temp_decoder_block = decoder_block(
             decoder_self_attention_block,
@@ -336,6 +357,7 @@ def build_transformer(src_vocab_size: int, tgt_vocab_size: int,
             dropout
         )
         decoder_blocks.append(temp_decoder_block)
+        
         
     # create encoder and decoder 
     main_encoder = encoder(nn.ModuleList(encoder_blocks), d_model)
