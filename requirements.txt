@@ -1,8 +1,8 @@
-# PyTorch 2.2 with CUDA 12.1 (for RTX 4060)
-torch==2.2.1+cu121
-torchvision==0.17.1+cu121
-torchaudio==2.2.1+cu121
--f https://download.pytorch.org/whl/torch_stable.html
+# PyTorch 2.5.1 with CUDA 12.1 (for RTX 3060)
+torch==2.5.1+cu121
+torchvision==0.20.1+cu121
+torchaudio==2.5.1+cu121
+--extra-index-url https://download.pytorch.org/whl/cu121
 
 # Hugging Face datasets and tokenizers
 datasets==2.16.1

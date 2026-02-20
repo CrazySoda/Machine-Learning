@@ -1,206 +1,362 @@
+# train_test.py  –  IMDB classification with Flash Attention (Triton)
+# Same architecture as Linformer/train_test.py, swapping Linformer projected
+# attention for Triton Flash Attention.  Saves profiling metrics to JSON files.
+
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
+import torch.optim as optim
+from torch.utils.data import DataLoader
+import time
+import json
+
 from datasets import load_dataset
-from tokenizers import Tokenizer
-from tokenizers.models import BPE
-from tokenizers.trainers import BpeTrainer
-from tokenizers.pre_tokenizers import ByteLevel
-from model import build_transformer
+from transformers import BertModel, BertTokenizer
+from sklearn.metrics import (
+    accuracy_score,
+    precision_recall_fscore_support,
+    roc_auc_score,
+    confusion_matrix,
+)
 from tqdm import tqdm
-from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-from sklearn.model_selection import train_test_split
-import math
 
-# ===============================
+from model import build_transformer, multihead_attentionblock
+from gpu_profiler import GPUProfiler
+
+# =====================================================
+# DEVICE
+# =====================================================
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using device:", device)
+
+# =====================================================
 # CONFIG
-# ===============================
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Device:", DEVICE)
+# =====================================================
+MAX_LEN = 512
+BATCH_SIZE = 8
+EPOCHS = 3
+LR = 2e-5
+D_MODEL = 768
+N_LAYERS = 12
+N_HEADS = 12
+D_FF = 3072
+USE_FLASH = True   # Use Triton flash attention
+CAUSAL = False     # Encoder self-attention is non-causal for classification
 
-SRC_LANG = "en"
-TGT_LANG = "de"
+# =====================================================
+# PROFILER  (used by model.py layers automatically)
+# =====================================================
+# Re-initialise the module-level profiler so every layer logs through the
+# same instance that we control here.
+import model as _model_module
 
-SRC_SEQ_LEN = 60
-TGT_SEQ_LEN = 60
-BATCH_SIZE = 64
-EPOCHS = 40
+profiler = GPUProfiler(logfile="gpu_profile.log", reset=True, tensorboard_logdir="./tb_logs")
+_model_module.profiler = profiler  # patch the module-level profiler
 
-D_MODEL = 256
-N = 4
-H = 4
-D_FF = 1024
-DROPOUT = 0.25
-PAD_IDX = 0
+# =====================================================
+# LOAD IMDB DATASET
+# =====================================================
+dataset = load_dataset("imdb")
+tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
-# ===============================
-# LOAD DATASET
-# ===============================
-print("Downloading dataset...")
-dataset = load_dataset("Helsinki-NLP/opus_books", "de-en")
-train_data = list(dataset["train"])
 
-train_data, val_data = train_test_split(train_data, test_size=0.05, random_state=42)
-print(f"Train samples: {len(train_data)}, Validation samples: {len(val_data)}")
-
-# ===============================
-# TOKENIZER (BPE)
-# ===============================
-def train_tokenizer(sentences):
-    tokenizer = Tokenizer(BPE(unk_token="<unk>"))
-    tokenizer.pre_tokenizer = ByteLevel()
-    trainer = BpeTrainer(
-        vocab_size=12000,
-        min_frequency=2,
-        special_tokens=["<pad>", "<sos>", "<eos>", "<unk>"]
+def tokenize(batch):
+    return tokenizer(
+        batch["text"],
+        padding="max_length",
+        truncation=True,
+        max_length=MAX_LEN,
     )
-    tokenizer.train_from_iterator(sentences, trainer)
-    return tokenizer
 
-print("Training tokenizers...")
-src_tokenizer = train_tokenizer(s["translation"][SRC_LANG] for s in train_data)
-tgt_tokenizer = train_tokenizer(s["translation"][TGT_LANG] for s in train_data)
 
-src_tokenizer.save("src_tokenizer.json")
-tgt_tokenizer.save("tgt_tokenizer.json")
+dataset = dataset.map(tokenize, batched=True)
+dataset.set_format(type="torch", columns=["input_ids", "attention_mask", "label"])
 
-SRC_VOCAB_SIZE = src_tokenizer.get_vocab_size()
-TGT_VOCAB_SIZE = tgt_tokenizer.get_vocab_size()
-print("Vocab sizes:", SRC_VOCAB_SIZE, TGT_VOCAB_SIZE)
+train_loader = DataLoader(dataset["train"], batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(dataset["test"], batch_size=BATCH_SIZE)
 
-# ===============================
-# DATASET
-# ===============================
-class TranslationDataset(Dataset):
-    def __init__(self, data):
-        self.data = data
+# =====================================================
+# BUILD TRANSFORMER  (encoder-only used, with Flash Attention)
+# =====================================================
+transformer_model = build_transformer(
+    src_vocab_size=tokenizer.vocab_size,
+    tgt_vocab_size=2,
+    src_seq_len=MAX_LEN,
+    tgt_seq_len=MAX_LEN,
+    d_model=D_MODEL,
+    N=N_LAYERS,
+    h=N_HEADS,
+    d_ff=D_FF,
+    use_flash=USE_FLASH,
+    causal=CAUSAL,
+).to(device)
 
-    def encode(self, tokenizer, text, max_len):
-        ids = tokenizer.encode(text).ids
-        ids = [1] + ids + [2]
-        ids = ids[:max_len]
-        ids += [PAD_IDX] * (max_len - len(ids))
-        return torch.tensor(ids)
 
-    def __getitem__(self, idx):
-        item = self.data[idx]["translation"]
-        return (
-            self.encode(src_tokenizer, item[SRC_LANG], SRC_SEQ_LEN),
-            self.encode(tgt_tokenizer, item[TGT_LANG], TGT_SEQ_LEN),
-        )
+# =====================================================
+# CLASSIFIER WITH CLS POOLING
+# =====================================================
+class Classifier(nn.Module):
+    def __init__(self, transformer):
+        super().__init__()
+        self.transformer = transformer
+        self.dropout = nn.Dropout(0.1)
+        self.classifier = nn.Linear(D_MODEL, 2)
 
-    def __len__(self):
-        return len(self.data)
+        # Embedding LayerNorm and Dropout (for BERT embedding transfer)
+        self.src_embed_layernorm = nn.LayerNorm(D_MODEL)
+        self.src_embed_dropout = nn.Dropout(0.1)
 
-train_loader = DataLoader(TranslationDataset(train_data), batch_size=BATCH_SIZE, shuffle=True)
-val_loader = DataLoader(TranslationDataset(val_data), batch_size=BATCH_SIZE)
+    def forward(self, input_ids, attention_mask):
+        # --- Embeddings ---
+        x = self.transformer.src_embed(input_ids)
+        x = x + self.transformer.src_pos.pe[:, : x.shape[1], :]
+        x = self.src_embed_layernorm(x)
+        x = self.src_embed_dropout(x)
 
-# ===============================
-# MASKS
-# ===============================
-def create_src_mask(src):
-    return (src != PAD_IDX).unsqueeze(1).unsqueeze(2)
+        # --- Attention mask ---
+        # Flash attention handles masking internally (causal flag),
+        # so we still pass the mask for non-flash fallback compatibility
+        mask = attention_mask.unsqueeze(1).unsqueeze(2)
 
-def create_tgt_mask(tgt):
-    seq_len = tgt.size(1)
-    padding = (tgt != PAD_IDX).unsqueeze(1).unsqueeze(2)
-    nopeak = torch.tril(torch.ones((1, seq_len, seq_len), device=tgt.device)).bool()
-    return padding & nopeak
+        # --- Encoder ---
+        x = self.transformer.encoder(x, mask)
 
-# ===============================
-# MODEL
-# ===============================
-model = build_transformer(
-    SRC_VOCAB_SIZE, TGT_VOCAB_SIZE,
-    SRC_SEQ_LEN, TGT_SEQ_LEN,
-    d_model=D_MODEL, N=N, h=H,
-    dropout=DROPOUT, d_ff=D_FF
-).to(DEVICE)
+        # --- CLS token pooling ---
+        cls_representation = x[:, 0, :]
+        cls_representation = self.dropout(cls_representation)
+        return self.classifier(cls_representation)
 
-criterion = nn.NLLLoss(ignore_index=PAD_IDX)
 
-# ===============================
-# OPTIMIZER + WARMUP
-# ===============================
-optimizer = torch.optim.Adam(model.parameters(), betas=(0.9, 0.98), eps=1e-9)
+classifier_model = Classifier(transformer_model).to(device)
 
-class WarmupScheduler:
-    def __init__(self, optimizer, d_model, warmup=4000):
-        self.optimizer = optimizer
-        self.step_num = 0
-        self.d_model = d_model
-        self.warmup = warmup
+# =====================================================
+# LOAD BERT & TRANSFER WEIGHTS
+# =====================================================
+print("Loading pretrained BERT...")
+bert = BertModel.from_pretrained("bert-base-uncased").to(device)
 
-    def step(self):
-        self.step_num += 1
-        lr = (self.d_model ** -0.5) * min(
-            self.step_num ** -0.5,
-            self.step_num * self.warmup ** -1.5
-        )
-        for p in self.optimizer.param_groups:
-            p["lr"] = lr
-        self.optimizer.step()
+print("Transferring weights...")
 
-scheduler = WarmupScheduler(optimizer, D_MODEL)
+# ---------------- Embeddings ----------------
+classifier_model.transformer.src_embed.embedding.weight.data.copy_(
+    bert.embeddings.word_embeddings.weight.data
+)
 
-# ===============================
-# BLEU
-# ===============================
-smooth_fn = SmoothingFunction().method1
+# Position embeddings
+classifier_model.transformer.src_pos.pe[:, :MAX_LEN, :].data.copy_(
+    bert.embeddings.position_embeddings.weight.data.unsqueeze(0)
+)
 
-def evaluate(loader):
-    model.eval()
-    bleu = []
+# Embedding LayerNorm
+classifier_model.src_embed_layernorm.weight.data.copy_(
+    bert.embeddings.LayerNorm.weight.data
+)
+classifier_model.src_embed_layernorm.bias.data.copy_(
+    bert.embeddings.LayerNorm.bias.data
+)
 
-    with torch.no_grad():
-        for src, tgt in loader:
-            src, tgt = src.to(DEVICE), tgt.to(DEVICE)
-            src_mask = create_src_mask(src)
+# ---------------- Encoder layers ----------------
+for i, layer in enumerate(bert.encoder.layer):
+    our_layer = classifier_model.transformer.encoder.layers[i]
 
-            tgt_in = tgt[:, :-1]
-            tgt_out = tgt[:, 1:]
-            tgt_mask = create_tgt_mask(tgt_in)
+    # ----- SELF ATTENTION -----
+    our_layer.self_attention_block.w_q.weight.data.copy_(
+        layer.attention.self.query.weight.data
+    )
+    our_layer.self_attention_block.w_q.bias.data.copy_(
+        layer.attention.self.query.bias.data
+    )
 
-            enc = model.encode(src, src_mask)
-            dec = model.decode(enc, src_mask, tgt_in, tgt_mask)
-            out = model.project(dec)
+    our_layer.self_attention_block.w_k.weight.data.copy_(
+        layer.attention.self.key.weight.data
+    )
+    our_layer.self_attention_block.w_k.bias.data.copy_(
+        layer.attention.self.key.bias.data
+    )
 
-            pred = out.argmax(-1)
+    our_layer.self_attention_block.w_v.weight.data.copy_(
+        layer.attention.self.value.weight.data
+    )
+    our_layer.self_attention_block.w_v.bias.data.copy_(
+        layer.attention.self.value.bias.data
+    )
 
-            for p, t in zip(pred, tgt_out):
-                p = [x for x in p.tolist() if x not in [0,1,2]]
-                t = [x for x in t.tolist() if x not in [0,1,2]]
-                if len(t) > 0:
-                    bleu.append(sentence_bleu([t], p, smoothing_function=smooth_fn))
+    our_layer.self_attention_block.w_o.weight.data.copy_(
+        layer.attention.output.dense.weight.data
+    )
+    our_layer.self_attention_block.w_o.bias.data.copy_(
+        layer.attention.output.dense.bias.data
+    )
 
-    return sum(bleu) / len(bleu)
+    # Dropout probability
+    our_layer.self_attention_block.dropout.p = layer.attention.output.dropout.p
 
-# ===============================
-# TRAIN
-# ===============================
+    # ----- FEED FORWARD -----
+    our_layer.feed_forward_block.linear_1.weight.data.copy_(
+        layer.intermediate.dense.weight.data
+    )
+    our_layer.feed_forward_block.linear_1.bias.data.copy_(
+        layer.intermediate.dense.bias.data
+    )
+
+    our_layer.feed_forward_block.linear_2.weight.data.copy_(
+        layer.output.dense.weight.data
+    )
+    our_layer.feed_forward_block.linear_2.bias.data.copy_(
+        layer.output.dense.bias.data
+    )
+
+    # ----- LAYER NORMS -----
+    our_layer.residual_connections[0].norm.alpha.data.copy_(
+        layer.attention.output.LayerNorm.weight.data
+    )
+    our_layer.residual_connections[0].norm.bias.data.copy_(
+        layer.attention.output.LayerNorm.bias.data
+    )
+
+    our_layer.residual_connections[1].norm.alpha.data.copy_(
+        layer.output.LayerNorm.weight.data
+    )
+    our_layer.residual_connections[1].norm.bias.data.copy_(
+        layer.output.LayerNorm.bias.data
+    )
+
+print("Weight transfer complete.")
+
+# Free BERT memory
+del bert
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
+
+# =====================================================
+# TRAINING SETUP
+# =====================================================
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.AdamW(classifier_model.parameters(), lr=LR)
+
+# =====================================================
+# METRIC CONTAINERS
+# =====================================================
+epoch_metrics = {
+    "training_time_per_epoch_sec": [],
+    "peak_memory_per_epoch_MB": [],
+    "loss_per_epoch": [],
+    "layer_profiles_per_epoch": [],  # list of dicts from profiler
+}
+
+# =====================================================
+# TRAIN LOOP
+# =====================================================
 for epoch in range(EPOCHS):
-    model.train()
-    total = 0
+    classifier_model.train()
+    total_loss = 0.0
 
-    for src, tgt in tqdm(train_loader, desc=f"Epoch {epoch+1}"):
-        src, tgt = src.to(DEVICE), tgt.to(DEVICE)
-        tgt_in = tgt[:, :-1]
-        tgt_out = tgt[:, 1:]
+    # Start profiler collection for this epoch
+    profiler.start_epoch_collection()
 
-        src_mask = create_src_mask(src)
-        tgt_mask = create_tgt_mask(tgt_in)
+    # Track epoch wall-clock time
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+    epoch_start = time.time()
 
-        enc = model.encode(src, src_mask)
-        dec = model.decode(enc, src_mask, tgt_in, tgt_mask)
-        out = model.project(dec)
-
-        loss = criterion(out.reshape(-1, out.size(-1)), tgt_out.reshape(-1))
+    loop = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+    for batch in loop:
+        input_ids = batch["input_ids"].to(device)
+        mask = batch["attention_mask"].to(device)
+        labels = batch["label"].to(device)
 
         optimizer.zero_grad()
+
+        outputs = classifier_model(input_ids, mask)
+        loss = criterion(outputs, labels)
+
         loss.backward()
-        scheduler.step()
 
-        total += loss.item()
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(classifier_model.parameters(), 1.0)
 
-    print(f"Epoch {epoch+1} Loss: {total/len(train_loader):.3f}")
-    print("Validation BLEU:", evaluate(val_loader))
+        optimizer.step()
+        total_loss += loss.item()
+        loop.set_postfix(loss=loss.item())
+
+    epoch_time = time.time() - epoch_start
+
+    # Collect peak memory for this epoch
+    peak_mem_MB = 0.0
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        peak_mem_MB = torch.cuda.max_memory_allocated() / 1024 ** 2
+
+    avg_loss = total_loss / len(train_loader)
+
+    # End profiler collection and get per-layer summary
+    layer_summary = profiler.end_epoch_collection()
+
+    # Store metrics
+    epoch_metrics["training_time_per_epoch_sec"].append(round(epoch_time, 3))
+    epoch_metrics["peak_memory_per_epoch_MB"].append(round(peak_mem_MB, 2))
+    epoch_metrics["loss_per_epoch"].append(round(avg_loss, 6))
+    epoch_metrics["layer_profiles_per_epoch"].append(layer_summary)
+
+    print(f"Epoch {epoch+1}  Loss: {avg_loss:.4f}  "
+          f"Time: {epoch_time:.1f}s  Peak VRAM: {peak_mem_MB:.1f} MB")
+    print("  Per-layer summary:")
+    for name, stats in layer_summary.items():
+        print(f"    {name:<25} mean_time={stats['mean_time_ms']:.2f} ms  "
+              f"mean_mem_delta={stats['mean_mem_delta_MB']:.2f} MB  "
+              f"calls={stats['calls']}")
+
+# =====================================================
+# SAVE TRAINING METRICS
+# =====================================================
+GPUProfiler.save_metrics(epoch_metrics, "flash_attention_training_metrics.json")
+
+# =====================================================
+# EVALUATION
+# =====================================================
+classifier_model.eval()
+
+all_preds = []
+all_labels = []
+all_probs = []
+
+with torch.no_grad():
+    loop = tqdm(test_loader, desc="Testing")
+    for batch in loop:
+        input_ids = batch["input_ids"].to(device)
+        mask = batch["attention_mask"].to(device)
+        labels = batch["label"].to(device)
+
+        outputs = classifier_model(input_ids, mask)
+        probs = torch.softmax(outputs, dim=1)
+        preds = torch.argmax(probs, dim=1)
+
+        all_preds.extend(preds.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        all_probs.extend(probs[:, 1].cpu().numpy())
+
+accuracy = accuracy_score(all_labels, all_preds)
+precision, recall, f1, _ = precision_recall_fscore_support(
+    all_labels, all_preds, average="binary"
+)
+roc_auc = roc_auc_score(all_labels, all_probs)
+conf_matrix = confusion_matrix(all_labels, all_preds)
+
+print("\n========== IMDB RESULTS (Flash Attention) ==========")
+print(f"Accuracy  : {accuracy:.4f}")
+print(f"Precision : {precision:.4f}")
+print(f"Recall    : {recall:.4f}")
+print(f"F1 Score  : {f1:.4f}")
+print(f"ROC-AUC   : {roc_auc:.4f}")
+print("\nConfusion Matrix:")
+print(conf_matrix)
+
+# Save eval metrics too
+eval_metrics = {
+    "accuracy": round(accuracy, 6),
+    "precision": round(precision, 6),
+    "recall": round(recall, 6),
+    "f1": round(f1, 6),
+    "roc_auc": round(roc_auc, 6),
+    "confusion_matrix": conf_matrix.tolist(),
+}
+GPUProfiler.save_metrics(eval_metrics, "flash_attention_eval_metrics.json")
