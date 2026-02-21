@@ -1,0 +1,21 @@
+============================================================
+  Evaluating on IMDB Test Set
+============================================================
+
+Testing: 100%|██████████| 1563/1563 [05:20<00:00,  4.88it/s]
+
+========== IMDB RESULTS (Nystromformer) ==========
+Accuracy  : 0.8425
+Precision : 0.8485
+Recall    : 0.8339
+F1 Score  : 0.8412
+ROC-AUC   : 0.9210
+
+Confusion Matrix:
+[[10639  1861]
+ [ 2076 10424]]
+
+========== GPU MEMORY ==========
+Allocated : 201.1 MB
+Reserved  : 838.0 MB
+Peak      : 225.1 MB
