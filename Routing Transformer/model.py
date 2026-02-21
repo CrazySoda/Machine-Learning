@@ -102,28 +102,28 @@ class local_attention_block(nn.Module):
         
     def forward(self, q, k, v, mask=None):
         profiler.start()
-        batch_size, seq_len, _ = q.shape
-        
-        query = self.w_q(q).view(batch_size, seq_len, self.h, self.d_k).transpose(1, 2)
-        key = self.w_k(k).view(batch_size, seq_len, self.h, self.d_k).transpose(1, 2)
-        value = self.w_v(v).view(batch_size, seq_len, self.h, self.d_k).transpose(1, 2)
+        batch_size, seq_len, _ = q.shape#batch size, sequence length, dimension of model
+
+        query = self.w_q(q).view(batch_size, seq_len, self.h, self.d_k).transpose(1, 2)#batch size, number of heads, sequence length, dimension of key
+        key = self.w_k(k).view(batch_size, seq_len, self.h, self.d_k).transpose(1, 2)#batch size, number of heads, sequence length, dimension of key
+        value = self.w_v(v).view(batch_size, seq_len, self.h, self.d_k).transpose(1, 2)#batch size, number of heads, sequence length, dimension of key
         
         # Local Attention Mask
         # We want to mask out keys that are further than window_size from the query
         # Create a local mask
         local_mask = (torch.ones(seq_len, seq_len, device=q.device).tril(0).bool() & 
                      torch.ones(seq_len, seq_len, device=q.device).triu(-self.window_size).bool())
-        local_mask = local_mask.unsqueeze(0).unsqueeze(0) # (1, 1, seq_len, seq_len)
+        local_mask = local_mask.unsqueeze(0).unsqueeze(0) # (1, 1, seq_len, seq_len) as we will need to broadcast it to (batch_size, num_heads, seq_len, seq_len)
         
         if mask is not None:
-             local_mask = local_mask & mask
-             
+             local_mask = local_mask & mask.bool() # (batch_size, num_heads, seq_len, seq_len)
+
         scores = (query @ key.transpose(-2, -1)) / math.sqrt(self.d_k)
         scores = scores.masked_fill(local_mask == 0, -1e9)
         attn = scores.softmax(dim=-1)
         attn = self.dropout(attn)
         
-        x = (attn @ value).transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
+        x = (attn @ value).transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)#(batch_size, num_heads, seq_len, d_k)-->(batch_size, seq_len, num_heads, d_k)-->(batch size, sequence length, d_model)
         x = self.w_o(x)
         profiler.end("LocalAttention")
         return x
@@ -154,7 +154,7 @@ class routing_attention_block(nn.Module):
         self.centroids = nn.Parameter(torch.randn(h, num_clusters, self.d_k))
         # Initialize centroids?
         nn.init.orthogonal_(self.centroids)
-        
+        #New_Centroid = (decay * Old_Centroid) + ((1 - decay) * Mean_of_Assigned_Words)
         self.decay = 0.999 # Exponential Moving Average decay
         
     def forward(self, q, k, v, mask=None):
@@ -167,7 +167,9 @@ class routing_attention_block(nn.Module):
         value = self.w_v(v).view(batch_size, seq_len, self.h, self.d_k).transpose(1, 2)
         
         # Normalize for spherical k-means (LayerNorm with no affine)
-        # We can just normalize manually L2 norm
+        # We can just normalize manually L2 norm 
+        # Why normalise? 
+        # The paper uses "Spherical K-Means". In standard K-Means, you measure distance using Euclidean distance (straight lines). In spherical K-Means, you project all your vectors onto the surface of a multi-dimensional sphere. F.normalize(..., p=2, dim=-1): This scales every vector so that its length (L2 norm) is exactly 1.0.The trick: When all vectors have a length of 1, the Euclidean distance between them becomes mathematically equivalent to their cosine similarity (the angle between them). This makes the clustering math much simpler and faster.
         query_norm = F.normalize(query, p=2, dim=-1)
         key_norm = F.normalize(key, p=2, dim=-1)
         # centroids should also be normalized usually, or at least used for comparison
@@ -215,7 +217,8 @@ class routing_attention_block(nn.Module):
                 mean_k = sum_k / count_k
                 
                 new_centers = (mean_q + mean_k) / 2.0
-                
+
+                #New_Centroid = (decay * Old_Centroid) + ((1 - decay) * Mean_of_Assigned_Words)
                 self.centroids.data = self.decay * self.centroids.data + (1 - self.decay) * new_centers
                 
         # Attention Computation
@@ -229,10 +232,10 @@ class routing_attention_block(nn.Module):
         # shape (B, H, L, L)
         # cluster_q: (B, H, L, 1)
         # cluster_k: (B, H, 1, L)
-        cluster_mask = cluster_q.unsqueeze(-1) == cluster_k.unsqueeze(-2) # (B, H, L, L)
+        cluster_mask = (cluster_q.unsqueeze(-1) == cluster_k.unsqueeze(-2)).bool() # (B, H, L, L)
         
         if mask is not None:
-            cluster_mask = cluster_mask & mask
+            cluster_mask = cluster_mask & mask.bool()
             
         # Standard Attention with this mask
         scores = (query @ key.transpose(-2, -1)) / math.sqrt(self.d_k)
@@ -249,7 +252,7 @@ class routing_attention_block(nn.Module):
         profiler.end("RoutingAttention")
         return x
 
-
+#hybrid attention of local and routing attention
 class sparse_multihead_attention_block(nn.Module):
     def __init__(self, d_model: int, h: int, num_clusters: int, window_size: int, dropout: float):
         super().__init__()
@@ -411,7 +414,7 @@ class routing_transformer(nn.Module):
     def project(self, x):
         return self.projection_layer(x)
     
-    
+#only uses the sparse multihead attention block
 def build_routing_transformer(src_vocab_size: int, tgt_vocab_size: int,
                               src_seq_len: int, tgt_seq_len: int,
                               d_model: int = 512, N: int = 6,

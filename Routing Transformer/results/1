@@ -1,0 +1,21 @@
+============================================================
+  Evaluating on IMDB Test Set
+============================================================
+
+Testing: 100%|██████████| 1563/1563 [06:30<00:00,  4.00it/s]
+
+========== IMDB RESULTS (Routing Transformer) ==========
+Accuracy  : 0.8414
+Precision : 0.8669
+Recall    : 0.8066
+F1 Score  : 0.8357
+ROC-AUC   : 0.9214
+
+Confusion Matrix:
+[[10952  1548]
+ [ 2417 10083]]
+
+========== GPU MEMORY ==========
+Allocated : 195.2 MB
+Reserved  : 852.0 MB
+Peak      : 219.2 MB
