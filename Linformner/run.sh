@@ -12,3 +12,5 @@ pip install -r ../requirements.txt --cache-dir "$MY_TMPDIR/pip_cache"
 
 
 nohup python3 train_test.py > run_output.log 2>&1 &
+
+python3 plot.py

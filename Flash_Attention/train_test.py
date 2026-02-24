@@ -1,6 +1,8 @@
 # train_test.py  –  IMDB classification with Flash Attention (Triton)
 # Saves per-epoch accuracy, training time, and layer profiling metrics to JSON.
 
+#flash attention
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -32,7 +34,7 @@ print("Using device:", device)
 # =====================================================
 MAX_LEN = 512
 BATCH_SIZE = 8
-EPOCHS = 2
+EPOCHS = 30
 LR = 2e-5
 D_MODEL = 768
 N_LAYERS = 12

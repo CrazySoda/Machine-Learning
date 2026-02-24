@@ -1,0 +1,66 @@
+{
+  "training_time_per_epoch_sec": [
+    1778.793,
+    1873.104
+  ],
+  "peak_memory_per_epoch_MB": [
+    7593.84,
+    7593.84
+  ],
+  "loss_per_epoch": [
+    0.484529,
+    0.322633
+  ],
+  "accuracy_per_epoch": [
+    0.8618,
+    0.82364
+  ],
+  "layer_profiles_per_epoch": [
+    {
+      "FeedForward": {
+        "mean_time_ms": 6.008282661437988,
+        "total_time_ms": 225310.59980392456,
+        "mean_mem_delta_MB": 120.0,
+        "mean_peak_MB": 5399.340090364583,
+        "calls": 37500
+      },
+      "Input Embedding": {
+        "mean_time_ms": 0.4741651916503906,
+        "total_time_ms": 1481.7662239074707,
+        "mean_mem_delta_MB": 12.0,
+        "mean_peak_MB": 2938.90128953125,
+        "calls": 3125
+      },
+      "MultiHeadAttention": {
+        "mean_time_ms": 7.883361549377441,
+        "total_time_ms": 295626.05810165405,
+        "mean_mem_delta_MB": 216.03484291666666,
+        "mean_peak_MB": 5359.199000364583,
+        "calls": 37500
+      }
+    },
+    {
+      "FeedForward": {
+        "mean_time_ms": 6.197517827351888,
+        "total_time_ms": 232406.9185256958,
+        "mean_mem_delta_MB": 120.0,
+        "mean_peak_MB": 5399.790364583333,
+        "calls": 37500
+      },
+      "Input Embedding": {
+        "mean_time_ms": 0.40977134704589846,
+        "total_time_ms": 1280.5354595184326,
+        "mean_mem_delta_MB": 12.0,
+        "mean_peak_MB": 2939.55322265625,
+        "calls": 3125
+      },
+      "MultiHeadAttention": {
+        "mean_time_ms": 8.155528755187989,
+        "total_time_ms": 305832.32831954956,
+        "mean_mem_delta_MB": 216.00390625,
+        "mean_peak_MB": 5359.67578125,
+        "calls": 37500
+      }
+    }
+  ]
+}
