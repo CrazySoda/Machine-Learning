@@ -12,3 +12,6 @@ tgt_tokenizer.json
 .gitignore
 
 tmp/
+
+Transformer/checkpoints_normal
+Transformer/tb_logs_normal
