@@ -9,6 +9,7 @@ tb_logs/
 *.log
 .venv
 .gitignore
+*.log
 
 tmp/
 
